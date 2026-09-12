@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it using the metadata below."
+
+title: "Humpback Song Acoustic Trajectory Matching"
+
+type: software
+
+authors:
+  - family-names: "Tkachenko"
+    given-names: "Vadym"
+
+abstract: >
+  A machine-assisted pipeline for multivariate acoustic trajectory
+  construction, quantitative trajectory similarity matching, manual
+  validation of recurrent acoustic units, and exploratory sequence
+  reconstruction in humpback whale song analysis.
+
+repository-code: "https://github.com/tkachenkovadvad-cloud/humpback-song-acoustic-trajectory-matching"
+
+license: "Apache-2.0"
+
+version: "1.0.0"
+
+date-released: "2026-09-12"
+
+keywords:
+  - "humpback whale"
+  - "whale song"
+  - "bioacoustics"
+  - "acoustic trajectory"
+  - "acoustic matching"
+  - "machine-assisted analysis"
+  - "sequence reconstruction"
