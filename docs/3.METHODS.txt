@@ -1,0 +1,2032 @@
+ACOUSTIC FEATURES AND THE SHARED XYZ SPACE
+==========================================
+
+Each audio frame is represented by a 29-dimensional acoustic feature vector:
+
+    F(t) = [
+        RMS_dB,
+        spectral_centroid,
+        spectral_bandwidth,
+        rolloff_85,
+        spectral_flatness,
+        spectral_entropy,
+        spectral_flux,
+        pitch,
+        voiced_probability,
+        MFCC_01, ..., MFCC_20
+    ]
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The 29 dimensions consist of nine explicit acoustic descriptors and twenty
+Mel-frequency cepstral coefficients (MFCCs).
+
+The final X, Y and Z values are not direct acoustic measurements such as
+frequency, amplitude, or duration. They are dimensionless coordinates obtained
+after transforming the original 29-dimensional feature representation through
+robust scaling, PCA, and UMAP.
+
+[Implementation source: acoustic_trajectory_v1_3.py; UMAP method: S19]
+
+
+A. TIME-FREQUENCY REPRESENTATION
+--------------------------------
+
+The feature extraction begins with a Short-Time Fourier Transform (STFT).
+
+The STFT analyzes successive, partially overlapping short sections of a signal
+with a discrete Fourier transform. In librosa, the output matrix has frequency
+bins along one axis and successive time frames along the other. [S1]
+
+The discrete Fourier transform of a length-N sequence can be written as:
+
+    X[k] =
+        SUM_(n=0)^(N-1)
+        x[n] * exp(-2*pi*j*k*n/N)
+
+    [S2]
+
+For an STFT, the DFT is repeatedly applied to windowed sections of the signal.
+A conceptual expression is:
+
+    S(k,t) =
+        SUM_n
+        x[n] *
+        w[n - tH] *
+        exp(-2*pi*j*k*n/N)
+
+    [Derived from the DFT definition in S2 and the windowed-frame
+     construction described in S1]
+
+where:
+
+    x[n] = waveform sample
+    w[n] = analysis window
+    N    = FFT length
+    H    = hop length
+    k    = frequency-bin index
+    t    = time-frame index
+
+The current implementation uses:
+
+    N          = 8192 samples
+    win_length = 8192 samples
+    H          = 1536 samples
+    window     = Hann
+    center     = True
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The complex STFT is converted to magnitude:
+
+    A(k,t) = |S(k,t)|
+
+    [S1]
+
+and power:
+
+    P(k,t) = |S(k,t)|^2
+
+    [Definition of power from magnitude; used directly by the pipeline]
+
+Most explicitly calculated spectral descriptors are restricted in the current
+pipeline to:
+
+    20 Hz <= f <= 8000 Hz
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The upper frequency boundary is restricted by the Nyquist frequency:
+
+    f_Nyquist = sample_rate / 2
+
+    [S2]
+
+and the implementation uses the effective upper bound:
+
+    f_max_effective =
+        min(
+            f_max_configured,
+            sample_rate / 2 - 1
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+
+TIME SPACING BETWEEN FRAMES
+---------------------------
+
+The time interval between consecutive frames is determined by the hop length:
+
+    delta_t = H / sample_rate
+
+    [From the hop-length definition in S1]
+
+For recordings sampled at 192000 Hz:
+
+    delta_t = 1536 / 192000
+            = 0.008 s
+            = 8 ms
+
+[Arithmetic using the implementation parameters]
+
+Thus, before later trajectory smoothing, one 29-dimensional acoustic feature
+vector is produced every 8 ms.
+
+
+FFT-BIN SPACING
+---------------
+
+For an N-point discrete Fourier transform, adjacent FFT-bin center frequencies
+are separated by:
+
+    delta_f = sample_rate / N
+
+    [From the DFT frequency-bin definition in S2]
+
+At 192000 Hz with N = 8192:
+
+    delta_f = 192000 / 8192
+            = 23.4375 Hz
+
+[Arithmetic using the implementation parameters]
+
+This value is FFT-bin spacing. It should not be interpreted as a guarantee that
+two arbitrary real acoustic components separated by 23.4375 Hz will always be
+resolved as independent physical sources.
+
+
+B. THE 29 ACOUSTIC FEATURE DIMENSIONS
+-------------------------------------
+
+
+1. RMS LEVEL IN DECIBELS
+------------------------
+
+Output column:
+
+    rms_db
+
+The pipeline obtains frame RMS values from the magnitude STFT using
+`librosa.feature.rms(S=...)`.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+For spectrogram input, librosa derives power from the squared magnitude
+spectrum and applies the correction required for a one-sided real-valued
+spectrum. The resulting RMS is the square root of this frame power. [S3]
+
+Conceptually:
+
+    RMS(t) = sqrt(P_frame(t))
+
+    [S3]
+
+The exact librosa spectrogram-based calculation uses the magnitude spectrum,
+including correction of the DC and Nyquist terms for the one-sided spectrum.
+[S3]
+
+The resulting RMS values are then converted to decibels with
+`librosa.amplitude_to_db`.
+
+The amplitude-to-decibel conversion is:
+
+    RMS_dB(t) =
+        20 * log10(
+            RMS(t) / RMS_ref
+        )
+
+    [S4]
+
+The pipeline sets:
+
+    RMS_ref = max_t RMS(t)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Therefore, the strongest RMS frame in each WAV is approximately:
+
+    0 dB
+
+while weaker frames have negative values.
+
+Librosa also applies its default `top_db=80` limit unless explicitly changed,
+so values more than 80 dB below the reference are clipped. [S4]
+
+Practical range:
+
+    approximately -80 dB to 0 dB
+
+Units:
+
+    dB relative to the maximum RMS frame of the individual WAV
+
+Role in the feature vector:
+
+RMS_dB describes the amplitude or energy envelope through time. Two frames can
+have similar spectral distributions but very different overall strengths, so
+RMS contributes information not contained in frequency-position descriptors.
+
+The raw `rms` value may also be exported, but the embedding feature matrix uses
+`rms_db`, not raw RMS.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+
+2. SPECTRAL CENTROID
+--------------------
+
+Output column:
+
+    spectral_centroid_hz
+
+Librosa defines spectral centroid for frame t as the weighted mean frequency:
+
+                         SUM_k S[k,t] * freq[k]
+    centroid(t) =       ------------------------
+                              SUM_j S[j,t]
+
+    [S5]
+
+In the present pipeline:
+
+    S[k,t] = band-limited magnitude spectrum
+    freq[k] = frequency of the corresponding FFT bin
+
+The implementation explicitly supplies the actual frequency vector associated
+with the restricted spectral band.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Units:
+
+    Hz
+
+Interpretation:
+
+A lower spectral centroid indicates that a larger proportion of spectral
+magnitude is concentrated at lower frequencies.
+
+A higher centroid indicates that the spectrum is weighted more strongly toward
+higher frequencies.
+
+Role in the feature vector:
+
+Spectral centroid provides a compact estimate of the central frequency
+position of the spectrum.
+
+
+3. SPECTRAL BANDWIDTH
+---------------------
+
+Output column:
+
+    spectral_bandwidth_hz
+
+Librosa defines p-order spectral bandwidth as:
+
+    BW_p(t) =
+        (
+            SUM_k
+            S_norm[k,t] *
+            |freq[k] - centroid(t)|^p
+        )^(1/p)
+
+    [S6]
+
+The default settings used by librosa, and retained by this pipeline, are:
+
+    p    = 2
+    norm = True
+
+    [S6]
+
+Therefore the current bandwidth is a second-order spectral spread:
+
+    BW(t) =
+        sqrt(
+            SUM_k
+            S_norm[k,t] *
+            |freq[k] - centroid(t)|^2
+        )
+
+    [S6]
+
+When `norm=True`, librosa normalizes the spectrum before evaluating bandwidth.
+[S6]
+
+Units:
+
+    Hz
+
+Interpretation:
+
+A spectrum concentrated close to its centroid tends to have a smaller
+bandwidth.
+
+A spectrum distributed over a wider frequency interval tends to have a larger
+bandwidth.
+
+Role in the feature vector:
+
+Spectral centroid measures where the spectrum is centered, whereas bandwidth
+measures how widely it is spread around that center. They therefore describe
+different aspects of spectral geometry.
+
+
+4. 85% SPECTRAL ROLLOFF
+-----------------------
+
+Output column:
+
+    rolloff85_hz
+
+The spectral rolloff frequency is the lowest frequency bin for which the
+cumulative spectral magnitude reaches a specified fraction of the total frame
+magnitude.
+
+Librosa defines the cumulative spectrum as:
+
+    C(k,t) =
+        SUM_(j=0)^k S[j,t]
+
+    [S7]
+
+For an 85% rolloff:
+
+    threshold(t) =
+        0.85 * SUM_j S[j,t]
+
+    [S7]
+
+The rolloff frequency is the first frequency f_k for which:
+
+    C(k,t) >= threshold(t)
+
+    [S7]
+
+The pipeline uses:
+
+    roll_percent = 0.85
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Units:
+
+    Hz
+
+Interpretation:
+
+A lower rolloff indicates that most of the spectral magnitude is accumulated
+at lower frequencies.
+
+A higher rolloff indicates that substantial spectral content extends farther
+toward the upper part of the spectrum.
+
+Role in the feature vector:
+
+Rolloff complements centroid and bandwidth by describing the upper frequency
+extent containing most of the spectral magnitude.
+
+IMPLEMENTATION NOTE
+
+Because the present pipeline first restricts the STFT to a selected frequency
+band, the frequency array supplied to the rolloff calculation must correspond
+to the rows of that restricted spectrogram.
+
+Librosa constructs its own FFT-frequency array if no explicit `freq` array is
+provided. [S7]
+
+Therefore, for a band-limited spectrogram `Sb` associated with frequencies
+`bf`, the frequency-safe call is:
+
+    librosa.feature.spectral_rolloff(
+        S = Sb,
+        freq = bf,
+        roll_percent = 0.85
+    )
+
+[Implementation requirement derived from S7]
+
+This should be verified in the release implementation so that values stored as
+`rolloff85_hz` use the true original STFT frequency axis.
+
+
+5. SPECTRAL FLATNESS
+--------------------
+
+Output column:
+
+    spectral_flatness
+
+The pipeline uses:
+
+    librosa.feature.spectral_flatness(S=Sb)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Librosa defines spectral flatness as the ratio of the geometric mean to the
+arithmetic mean of spectral values. Its default setting is:
+
+    power = 2.0
+
+    [S9]
+
+Therefore, for input magnitude S(k,t), librosa first constructs approximately:
+
+    Q(k,t) =
+        max(
+            amin,
+            S(k,t)^2
+        )
+
+    [S9]
+
+The geometric mean is:
+
+    G(t) =
+        exp(
+            (1/K) *
+            SUM_k ln(Q(k,t))
+        )
+
+    [S9]
+
+The arithmetic mean is:
+
+    A_mean(t) =
+        (1/K) *
+        SUM_k Q(k,t)
+
+    [S9]
+
+and spectral flatness is:
+
+    flatness(t) =
+        G(t) / A_mean(t)
+
+    [S9]
+
+Units:
+
+    dimensionless
+
+Typical range:
+
+    0 <= flatness <= 1
+
+    [S9]
+
+Interpretation:
+
+Values closer to zero indicate that spectral energy is concentrated into
+relatively few peaks.
+
+Values closer to one indicate a more uniformly distributed, noise-like
+spectrum.
+
+Role in the feature vector:
+
+Centroid, bandwidth and rolloff describe the position and spread of spectral
+content, but they do not fully describe whether the spectrum consists of
+strong narrow peaks or a relatively uniform distribution.
+
+Flatness provides this additional information.
+
+
+6. SPECTRAL ENTROPY
+-------------------
+
+Output column:
+
+    spectral_entropy
+
+Spectral entropy is calculated directly in `acoustic_trajectory_v1_3.py`,
+rather than by a separate librosa feature function.
+
+The calculation uses the power spectrum:
+
+    P(k,t) = |S(k,t)|^2
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Power values are normalized within each frame:
+
+                         P(k,t)
+    p(k,t) =        ----------------
+                     SUM_j P(j,t)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+so that:
+
+    SUM_k p(k,t) = 1
+
+[Direct consequence of the normalization above]
+
+The pipeline then calculates Shannon entropy:
+
+    H(t) =
+        -SUM_k
+        p(k,t) * log2(p(k,t))
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+A small numerical floor is applied before the logarithm to avoid evaluation at
+zero.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Units:
+
+    bits
+
+Interpretation:
+
+Low spectral entropy means that spectral power is concentrated into a smaller
+number of frequency bins.
+
+High spectral entropy means that power is distributed more broadly across the
+spectrum.
+
+Role in the feature vector:
+
+Entropy describes the organization and concentration of spectral power. It is
+related to spectral flatness, but the two descriptors use different
+mathematical constructions and therefore do not contain exactly the same
+information.
+
+
+7. SPECTRAL FLUX
+----------------
+
+Output column:
+
+    spectral_flux
+
+Spectral flux is also calculated directly in the pipeline.
+
+Each magnitude spectrum is first normalized by its Euclidean, or L2, norm:
+
+                               S(k,t)
+    S_norm(k,t) =       ---------------------
+                         sqrt(SUM_j S(j,t)^2)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+A small numerical lower bound is used for the denominator to avoid division by
+zero.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The frame-to-frame spectral flux is then calculated as Euclidean distance
+between two consecutive normalized spectra:
+
+    flux(t) =
+        sqrt(
+            SUM_k
+            [
+                S_norm(k,t) -
+                S_norm(k,t-1)
+            ]^2
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+For the first frame, the implementation prepends the first spectrum before
+differencing, so:
+
+    flux(0) = 0
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Units:
+
+    dimensionless
+
+Interpretation:
+
+Small flux indicates relatively little change in spectral shape between
+adjacent frames.
+
+Large flux indicates stronger frame-to-frame spectral change.
+
+Role in the feature vector:
+
+Most other descriptors characterize the state of one frame. Spectral flux
+explicitly incorporates local temporal change and therefore contributes
+information about transitions, modulation, and rapidly changing internal
+structure.
+
+
+8. PITCH / FUNDAMENTAL FREQUENCY
+--------------------------------
+
+Output column:
+
+    pitch_hz
+
+Fundamental frequency is estimated with the probabilistic YIN algorithm:
+
+    librosa.pyin(...)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+pYIN is a probabilistic modification of the YIN fundamental-frequency
+estimator. According to the librosa implementation documentation, it first
+generates F0 candidates and probabilities using the YIN procedure and then
+uses Viterbi decoding to estimate the most likely F0 sequence and voicing
+state. [S10]
+
+For a perfectly periodic signal, fundamental frequency can be described as:
+
+    f0 = 1 / T0
+
+where:
+
+    T0 = fundamental period
+
+[Basic definition of fundamental frequency; pYIN estimates f0 directly in Hz,
+S10]
+
+The pYIN output `f0` is explicitly expressed in:
+
+    Hz
+
+    [S10]
+
+The current pipeline defines its lower pitch-search bound as:
+
+    pyin_fmin =
+        max(
+            configured_fmin,
+            2 * sample_rate / frame_length + 0.1
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+with:
+
+    frame_length =
+        max(
+            win_length,
+            2048
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+For the current configuration:
+
+    frame_length = 8192
+
+[Arithmetic from the implementation parameters]
+
+Missing pYIN estimates are interpolated where valid neighboring estimates are
+available. If pYIN fails completely for a signal, the implementation
+substitutes zeros.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Role in the feature vector:
+
+Pitch provides a direct description of periodic or harmonic structure. A
+change in F0 does not necessarily correspond to the same change in centroid,
+bandwidth or rolloff, so pitch contributes a distinct dimension of acoustic
+information.
+
+
+9. VOICED PROBABILITY
+---------------------
+
+Output column:
+
+    voiced_probability
+
+The pYIN implementation returns three principal outputs:
+
+    f0
+    voiced_flag
+    voiced_probability
+
+    [S10]
+
+Librosa defines `voiced_prob` as the probability that a frame is voiced. [S10]
+
+Range:
+
+    0 <= voiced_probability <= 1
+
+Units:
+
+    dimensionless probability
+
+Interpretation:
+
+A value closer to one indicates stronger algorithmic support for a periodic
+or voiced state.
+
+A value closer to zero indicates weaker support.
+
+Role in the feature vector:
+
+Pitch alone gives an estimated F0 but does not indicate how strongly that F0
+is supported by the periodicity model.
+
+Voiced probability therefore adds information about confidence in the
+periodic interpretation of the frame.
+
+
+10-29. MFCC_01 TO MFCC_20
+-------------------------
+
+Output columns:
+
+    mfcc_01
+    mfcc_02
+    mfcc_03
+    ...
+    mfcc_20
+
+The final twenty feature dimensions are Mel-frequency cepstral coefficients
+(MFCCs).
+
+MFCCs provide a compact transformed representation of the log-Mel spectral
+shape.
+
+They are twenty numerical dimensions, but they should not be interpreted as
+twenty independent physical quantities such as frequencies, amplitudes, or
+durations.
+
+
+STEP 1: MEL POWER SPECTROGRAM
+-----------------------------
+
+The pipeline constructs a Mel spectrogram with:
+
+    n_mels = 64
+    power  = 2.0
+    fmin   = 20 Hz
+    fmax   = effective upper frequency
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Librosa describes Mel-spectrogram construction as application of a Mel filter
+bank to a magnitude spectrogram raised to a selected power. For the default
+power value of 2, this is a power spectrogram. [S11]
+
+For Mel band m:
+
+    E_m(t) =
+        SUM_k
+        M(m,k) *
+        |S(k,t)|^2
+
+    [S11]
+
+where:
+
+    M(m,k) = weight of FFT bin k in Mel filter m
+
+Thus, each Mel-band value is a weighted sum of FFT-bin powers.
+
+
+THE MEL FREQUENCY SCALE
+-----------------------
+
+The current implementation does not request:
+
+    htk = True
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Librosa therefore uses its default Slaney-style Mel scale. [S12]
+
+The implementation uses a linear frequency-to-Mel mapping below 1000 Hz.
+
+The source code defines:
+
+    f_sp = 200 / 3
+
+    [S13]
+
+and below 1000 Hz:
+
+    mel(f) =
+        f / f_sp
+
+    [S13]
+
+or:
+
+    mel(f) =
+        f / (200/3)
+
+    [S13]
+
+At:
+
+    f = 1000 Hz
+
+this gives:
+
+    mel = 15
+
+    [S13]
+
+Above 1000 Hz, the librosa Slaney implementation changes to a logarithmic
+mapping:
+
+    mel(f) =
+        15 +
+        ln(f / 1000) /
+        logstep
+
+    [S13]
+
+with:
+
+    logstep =
+        ln(6.4) / 27
+
+    [S13]
+
+Therefore:
+
+    mel(f) =
+        15 +
+        ln(f / 1000) /
+        [ln(6.4) / 27]
+
+    [S13]
+
+This is important because the frequently quoted HTK expression:
+
+    mel(f) =
+        2595 * log10(1 + f/700)
+
+is NOT the default Mel conversion used by this pipeline.
+
+
+STEP 2: LOG-POWER MEL REPRESENTATION
+------------------------------------
+
+The Mel power spectrogram is converted to decibels with
+`librosa.power_to_db`.
+
+For power values, the conversion is:
+
+    L_m(t) =
+        10 * log10(
+            E_m(t) / E_ref
+        )
+
+    [S14]
+
+The current pipeline uses the maximum Mel-spectrogram power as the reference:
+
+    E_ref =
+        max_(m,t) E_m(t)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Therefore the strongest Mel power is mapped to approximately:
+
+    0 dB
+
+while weaker values become negative.
+
+Librosa's default `top_db=80` limits values to at most 80 dB below the
+reference. [S14]
+
+
+STEP 3: DISCRETE COSINE TRANSFORM
+---------------------------------
+
+The resulting log-Mel representation is passed to:
+
+    librosa.feature.mfcc(
+        S = log_Mel,
+        n_mfcc = 20
+    )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Librosa uses by default:
+
+    dct_type = 2
+    norm     = "ortho"
+
+    [S15]
+
+The unnormalized DCT-II is defined by SciPy as:
+
+    y[k] =
+        2 *
+        SUM_(n=0)^(N-1)
+        x[n] *
+        cos(
+            pi * k * (2*n + 1) /
+            (2*N)
+        )
+
+    [S16]
+
+With orthonormal normalization, SciPy applies coefficient-dependent scaling
+so that the DCT basis becomes orthonormal. [S16]
+
+For DCT-II, the normalization factors are:
+
+    scale(k) =
+        sqrt(1/(4*N))     for k = 0
+
+and:
+
+    scale(k) =
+        sqrt(1/(2*N))     for k > 0
+
+    [S16]
+
+Librosa applies this DCT to the log-Mel representation and retains the first
+20 cepstral coefficients. [S15]
+
+Thus:
+
+    log-Mel spectrum
+        ->
+    DCT-II
+        ->
+    MFCC_01 ... MFCC_20
+
+Units:
+
+    no direct physical unit
+
+
+INTERPRETATION OF THE 20 MFCC DIMENSIONS
+----------------------------------------
+
+MFCCs should primarily be interpreted jointly as a compact representation of
+spectral-envelope shape.
+
+Lower-order cepstral dimensions represent broader variation across the
+log-Mel spectrum, while progressively higher-order coefficients are associated
+with finer structure in the cepstral representation.
+
+This interpretation follows from the increasing spatial frequency of the
+cosine basis functions in the DCT-II representation. [S16]
+
+An individual MFCC value therefore does NOT have a direct interpretation such
+as:
+
+    MFCC_07 = 15 Hz
+
+or:
+
+    MFCC_07 = 15 dB
+
+Instead, the pattern across the twenty coefficients describes the transformed
+spectral envelope.
+
+
+C. WHY ALL 29 DIMENSIONS ARE INCLUDED
+-------------------------------------
+
+The 29-dimensional vector deliberately combines multiple complementary
+descriptions of each frame.
+
+A useful functional grouping is:
+
+    AMPLITUDE / ENERGY
+
+        RMS_dB
+
+    SPECTRAL POSITION AND EXTENT
+
+        spectral_centroid
+        spectral_bandwidth
+        rolloff_85
+
+    SPECTRAL DISTRIBUTION AND ORGANIZATION
+
+        spectral_flatness
+        spectral_entropy
+
+    LOCAL TEMPORAL CHANGE
+
+        spectral_flux
+
+    PERIODIC / HARMONIC STRUCTURE
+
+        pitch
+        voiced_probability
+
+    LOG-MEL SPECTRAL-ENVELOPE REPRESENTATION
+
+        MFCC_01 ... MFCC_20
+
+The features are not assumed to be statistically independent.
+
+For example:
+
+    spectral_centroid,
+    spectral_bandwidth,
+    and rolloff
+
+can covary because they are all derived from the frequency distribution of
+spectral magnitude.
+
+Similarly:
+
+    spectral_flatness
+    and spectral_entropy
+
+both respond to how spectral content is distributed, although they use
+different mathematical definitions.
+
+MFCCs are also derived from the spectrum and therefore inevitably share some
+information with explicit spectral descriptors.
+
+This redundancy is intentional.
+
+The objective of the feature stage is not to create 29 independent biological
+variables. It is to retain several complementary views of the acoustic frame
+before dimensionality reduction.
+
+The subsequent PCA stage is specifically suited to representing correlated
+multivariate data using a smaller set of orthogonal components. [S18]
+
+
+D. ROBUST SCALING OF THE 29 FEATURES
+------------------------------------
+
+The raw features have very different numerical scales.
+
+For example:
+
+    spectral centroid  -> Hz
+    spectral bandwidth -> Hz
+    pitch              -> Hz
+    RMS_dB             -> dB
+    voiced probability -> approximately 0 to 1
+    spectral flatness  -> approximately 0 to 1
+    MFCCs              -> transformed coefficients
+
+Without scaling, a feature with numerically large raw values could influence
+Euclidean geometry much more strongly simply because of its numerical units.
+
+The pipeline therefore pools frame-level feature vectors from all WAVs in the
+same shared-space run and applies:
+
+    RobustScaler(
+        quantile_range = (10, 90)
+    )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Scikit-learn RobustScaler centers each feature by its median and scales it
+according to the selected quantile range. The operation is performed
+independently for each feature. [S17]
+
+For feature j:
+
+                            x_j - median_j
+    x_scaled_j =       ------------------------
+                           Q90_j - Q10_j
+
+    [S17, using the pipeline-specific quantile_range=(10,90)]
+
+where:
+
+    median_j = median of feature j
+    Q10_j    = 10th percentile of feature j
+    Q90_j    = 90th percentile of feature j
+
+The implementation then clips the standardized values:
+
+    x_clipped_j =
+        min(
+            8,
+            max(
+                -8,
+                x_scaled_j
+            )
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+so that:
+
+    -8 <= x_clipped_j <= 8
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+This clipping operation is specific to the present pipeline; it is not an
+intrinsic part of scikit-learn RobustScaler.
+
+
+E. PRINCIPAL COMPONENT ANALYSIS
+-------------------------------
+
+The robust-scaled 29-dimensional vectors are then reduced with Principal
+Component Analysis (PCA).
+
+The current implementation retains at most:
+
+    10 principal components
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+or fewer if the number of available observations or input dimensions does not
+permit ten components.
+
+PCA constructs orthogonal directions in feature space that successively
+capture the largest possible remaining variance in the centered data. [S18]
+
+For centered vector x and PCA loading vector w_i, projection onto component i
+can be expressed as:
+
+    PC_i =
+        w_i^T * x
+
+    [Standard PCA projection corresponding to the principal-subspace
+     transformation described in S18]
+
+Thus, the dimensionality is reduced approximately as:
+
+    29 dimensions
+        ->
+    <= 10 PCA dimensions
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The PCA coordinates are then robust-scaled again using:
+
+    quantile_range = (10, 90)
+
+[Implementation source: acoustic_trajectory_v1_3.py; scaling definition S17]
+
+and clipped again to:
+
+    -8 <= PCA_scaled_i <= 8
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The second scaling stage places the retained PCA coordinates on comparable
+robust numerical scales before the nonlinear embedding.
+
+
+F. UMAP AND THE SHARED X, Y, Z SPACE
+------------------------------------
+
+The scaled PCA representation is reduced to three dimensions with UMAP.
+
+The current implementation uses:
+
+    n_components = 3
+    n_neighbors  = min(25, N_fit - 1)
+    min_dist     = 0.05
+    metric       = "euclidean"
+    random_state = 42
+    transform_seed = 42
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+UMAP uses a neighborhood graph in the high-dimensional representation and
+constructs a low-dimensional embedding intended to preserve its manifold
+structure, particularly local neighborhood relationships. [S19, S20]
+
+The parameter:
+
+    n_neighbors
+
+controls the local neighborhood size considered when constructing the
+high-dimensional representation. [S19]
+
+The parameter:
+
+    min_dist
+
+controls how tightly nearby observations may be packed in the resulting
+low-dimensional embedding. [S19]
+
+The parameter:
+
+    n_components = 3
+
+sets the dimensionality of the final embedding to three coordinates. [S19]
+
+The parameter:
+
+    metric = "euclidean"
+
+specifies Euclidean distance as the input-space metric used by UMAP in this
+pipeline. [S19]
+
+
+UMAP FIT SUBSAMPLING
+--------------------
+
+If more than 4000 pooled frames are available, the current pipeline fits the
+UMAP model on no more than 4000 distributed frame indices.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The fitted UMAP transformation is then applied to all frame vectors.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+This limits computational cost while retaining one shared fitted projection
+for all signals in the run.
+
+
+WHAT X, Y AND Z MEAN
+--------------------
+
+Each frame begins as:
+
+    F(t) in R^29
+
+where R^29 denotes a 29-dimensional real-valued feature space.
+
+The processing sequence is:
+
+    F(t)
+        |
+        v
+    RobustScaler
+        |
+        v
+    clipping
+        |
+        v
+    PCA
+        |
+        v
+    RobustScaler
+        |
+        v
+    clipping
+        |
+        v
+    UMAP
+        |
+        v
+    [X(t), Y(t), Z(t)]
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+X, Y and Z are dimensionless embedding coordinates.
+
+They are NOT directly interpretable as:
+
+    X = frequency
+    Y = amplitude
+    Z = entropy
+
+or any other fixed mapping of individual acoustic descriptors.
+
+The location of a frame in XYZ space results from the combined multivariate
+structure of the original acoustic feature vector after PCA and UMAP
+transformation.
+
+UMAP is designed to preserve neighborhood relationships from the
+high-dimensional representation in the reduced embedding rather than to give
+each output axis an independent physical meaning. [S19, S20]
+
+Therefore, the important information is primarily the relative geometry among
+points and trajectories, not the absolute numerical interpretation of any one
+axis.
+
+
+THE ACOUSTIC TRAJECTORY
+-----------------------
+
+For a signal with T frames, the ordered sequence:
+
+    [X(1), Y(1), Z(1)]
+    [X(2), Y(2), Z(2)]
+    [X(3), Y(3), Z(3)]
+    ...
+    [X(T), Y(T), Z(T)]
+
+forms its acoustic trajectory.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Each point represents the multivariate acoustic state of one frame after
+dimensionality reduction.
+
+The sequence of points represents how that acoustic state changes through
+time.
+
+This is why the representation is described as a trajectory rather than a
+static acoustic fingerprint.
+
+
+WHY THE SPACE MUST BE SHARED
+----------------------------
+
+Signals intended for direct geometric comparison are processed together in
+one run.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The shared run uses the same:
+
+    feature scaling
+    PCA model
+    PCA scaling
+    UMAP model
+
+for all included WAV files.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Therefore, their XYZ coordinates exist in the same fitted coordinate system.
+
+Signals embedded in separate independently fitted PCA/UMAP spaces should not
+be treated as though their XYZ coordinates belong to one common coordinate
+system.
+
+This follows from the fact that PCA components and UMAP embeddings are fitted
+from the particular data supplied to them rather than being fixed universal
+acoustic axes. [S18, S19]
+
+
+G. LIGHT TEMPORAL SMOOTHING OF XYZ
+----------------------------------
+
+After projection, each XYZ coordinate is lightly smoothed through time with a
+moving average.
+
+For X:
+
+    X_smooth(t) =
+        (1/W) *
+        SUM_(i in local window)
+        X(i)
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The same operation is applied independently to Y and Z.
+
+The smoothing window is selected as:
+
+    W =
+        max(
+            3,
+            min(
+                21,
+                2 * floor(N_frames / 250) + 3
+            )
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The implementation ensures that W is odd.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Therefore:
+
+    3 <= W <= 21 frames
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+At an 8-ms frame hop:
+
+    3 frames  = 24 ms
+    21 frames = 168 ms
+
+[Arithmetic using the implementation frame spacing]
+
+This smoothing occurs after the shared PCA/UMAP projection.
+
+It therefore modifies only the local temporal smoothness of each trajectory;
+it does not retrain or redefine the shared acoustic coordinate system.
+
+
+H. NATURAL ACOUSTIC EVENTS AND NODES
+------------------------------------
+
+The 29-dimensional frame representation is also used to identify strong
+internal acoustic changes within individual signals.
+
+For this stage, the features of an individual signal are robust-scaled using:
+
+    RobustScaler(
+        quantile_range = (10, 90)
+    )
+
+[Implementation source: acoustic_trajectory_v1_3.py; scaling definition S17]
+
+Let the scaled feature vector at frame t be:
+
+    Z(t) =
+        [
+            Z_1(t),
+            Z_2(t),
+            ...
+            Z_29(t)
+        ]
+
+Frame-to-frame acoustic novelty is calculated as Euclidean distance between
+successive scaled feature vectors:
+
+    novelty(t) =
+        ||Z(t) - Z(t-1)||_2
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+or explicitly:
+
+    novelty(t) =
+        sqrt(
+            SUM_(j=1)^29
+            [
+                Z_j(t) -
+                Z_j(t-1)
+            ]^2
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+Thus, novelty is large when many acoustic descriptors change substantially
+between adjacent frames and small when the multivariate acoustic state remains
+similar.
+
+
+NOVELTY SMOOTHING
+-----------------
+
+The novelty curve is temporally smoothed.
+
+The target smoothing duration is approximately:
+
+    0.080 s
+
+or:
+
+    80 ms
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The corresponding number of frames is approximately:
+
+    N_smooth =
+        round(
+            0.080 *
+            sample_rate /
+            hop_length
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+
+MINIMUM EVENT SEPARATION
+------------------------
+
+Candidate acoustic-change peaks are required to be separated by approximately:
+
+    0.120 s
+
+or:
+
+    120 ms
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The corresponding frame separation is approximately:
+
+    N_min_distance =
+        round(
+            0.120 *
+            sample_rate /
+            hop_length
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+
+PEAK SELECTION
+--------------
+
+Candidate events are selected from local maxima of the smoothed novelty curve.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The initial prominence criterion is based on the 35th percentile of positive
+novelty values:
+
+    prominence =
+        Q35(
+            novelty(t)
+            for novelty(t) > 0
+        )
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+If too few peaks are found, the implementation can supplement them using the
+strongest remaining local maxima while maintaining the required minimum
+distance.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+The current implementation limits the number of detected nodes to:
+
+    maximum_nodes = 40
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+These nodes therefore represent data-driven regions of relatively strong
+multivariate acoustic change.
+
+They are not equal-duration subdivisions of the WAV.
+
+
+EVENT CENTROIDS
+---------------
+
+For each resulting acoustic event or interval, the pipeline records summary
+feature information and positions associated with the event in the same shared
+XYZ space.
+
+[Implementation source: acoustic_trajectory_v1_3.py]
+
+This produces event-level points that can be used alongside the complete
+frame-level trajectory in later comparison stages.
+
+
+I. WHY THIS REPRESENTATION IS USEFUL FOR TRAJECTORY COMPARISON
+--------------------------------------------------------------
+
+A conventional scalar acoustic measurement reduces each frame to one number.
+
+The present representation instead combines:
+
+    amplitude
+    spectral position
+    spectral spread
+    upper spectral extent
+    spectral organization
+    temporal spectral change
+    harmonic periodicity
+    voicing evidence
+    log-Mel spectral shape
+
+into one multivariate acoustic state.
+
+That state is compressed into a common three-dimensional embedding.
+
+As a result, comparison can consider not only where a signal lies acoustically
+but how it moves through the shared acoustic space through time.
+
+This temporal geometric representation is the basis for the downstream
+trajectory-similarity matcher.
+
+[Implementation source: acoustic_trajectory_v1_3.py and
+trajectory_similarity_matcher_v0_6.py]
+
+
+J. COMPLETE PROCESSING SUMMARY
+------------------------------
+
+For every short WAV:
+
+    waveform
+        |
+        v
+    STFT
+        |
+        v
+    magnitude / power spectrum
+        |
+        v
+    29-dimensional acoustic feature vector per frame
+        |
+        +-- 1  RMS_dB
+        +-- 2  spectral centroid
+        +-- 3  spectral bandwidth
+        +-- 4  85% spectral rolloff
+        +-- 5  spectral flatness
+        +-- 6  spectral entropy
+        +-- 7  spectral flux
+        +-- 8  pitch / F0
+        +-- 9  voiced probability
+        +-- 10-29  MFCC_01 ... MFCC_20
+        |
+        v
+    shared RobustScaler
+        |
+        v
+    clipping to [-8,+8]
+        |
+        v
+    PCA
+        |
+        +-- maximum 10 components
+        |
+        v
+    RobustScaler of PCA coordinates
+        |
+        v
+    clipping to [-8,+8]
+        |
+        v
+    UMAP
+        |
+        +-- 3 components
+        +-- Euclidean metric
+        +-- n_neighbors <= 25
+        +-- min_dist = 0.05
+        |
+        v
+    X, Y, Z
+        |
+        v
+    light temporal smoothing
+        |
+        v
+    time-ordered acoustic trajectory
+
+In parallel:
+
+    29-dimensional features
+        |
+        v
+    within-signal robust scaling
+        |
+        v
+    frame-to-frame Euclidean novelty
+        |
+        v
+    novelty smoothing
+        |
+        v
+    local acoustic-change peaks
+        |
+        v
+    acoustic events / nodes
+        |
+        v
+    event summaries and shared-space centroid coordinates
+
+
+K. INTERPRETATION IN ONE SENTENCE
+---------------------------------
+
+The XYZ acoustic trajectory is a dimensionless, time-ordered representation
+of how a 29-dimensional description of each acoustic frame changes within a
+shared PCA/UMAP space.
+
+
+SOURCES
+=======
+
+S1. McFee, B. et al. librosa.stft documentation.
+    Short-Time Fourier Transform.
+
+    Supports:
+    - STFT as Fourier analysis of successive short frames
+    - frequency x time structure of the STFT matrix
+    - hop_length
+    - win_length
+    - Hann/window handling
+    - magnitude as abs(STFT)
+
+    URL:
+    https://librosa.org/doc/0.10.2/generated/librosa.stft.html
+
+
+S2. SciPy Developers. scipy.fft.fft documentation.
+
+    Supports:
+    - discrete Fourier transform definition
+    - DFT frequency-bin structure
+    - interpretation of Nyquist-frequency bin
+
+    URL:
+    https://docs.scipy.org/doc/scipy/reference/generated/scipy.fft.fft.html
+
+
+S3. McFee, B. et al. librosa.feature.rms implementation/source.
+
+    Supports:
+    - RMS calculation from spectrogram input
+    - squaring of spectral magnitude
+    - one-sided spectrum correction
+    - square root of frame power
+
+    URL:
+    https://librosa.org/doc/0.11.0/_modules/librosa/feature/spectral.html
+
+
+S4. McFee, B. et al. librosa.amplitude_to_db documentation.
+
+    Supports:
+    - amplitude-to-decibel conversion
+    - 20*log10 amplitude scaling
+    - reference amplitude
+    - default top_db=80 behavior
+
+    URL:
+    https://librosa.org/doc/0.10.2/generated/librosa.amplitude_to_db.html
+
+
+S5. McFee, B. et al. librosa.feature.spectral_centroid documentation.
+
+    Supports:
+    - spectral-centroid equation
+    - normalized magnitude weighting by frequency
+
+    URL:
+    https://librosa.org/doc/0.11.0/generated/librosa.feature.spectral_centroid.html
+
+
+S6. McFee, B. et al. librosa.feature.spectral_bandwidth documentation.
+
+    Supports:
+    - p-order spectral-bandwidth equation
+    - default p=2
+    - default norm=True
+    - distance from spectral centroid
+
+    URL:
+    https://librosa.org/doc/0.10.2/generated/librosa.feature.spectral_bandwidth.html
+
+
+S7. McFee, B. et al. librosa.feature.spectral_rolloff documentation and
+    source implementation.
+
+    Supports:
+    - cumulative spectral-energy/magnitude calculation
+    - roll_percent threshold
+    - first frequency reaching the threshold
+    - use of explicit `freq` values when supplied
+    - construction of an FFT frequency axis when `freq` is omitted
+
+    URLs:
+    https://librosa.org/doc/0.10.2/generated/librosa.feature.spectral_rolloff.html
+    https://librosa.org/doc/0.11.0/_modules/librosa/feature/spectral.html
+
+
+S8. McFee, B. et al. librosa core spectrum implementation.
+
+    Supports:
+    - librosa handling of a supplied spectrogram
+    - relationship between spectrogram row count and inferred FFT size
+
+    URL:
+    https://librosa.org/doc/latest/_modules/librosa/core/spectrum.html
+
+
+S9. McFee, B. et al. librosa.feature.spectral_flatness documentation and
+    source implementation.
+
+    Supports:
+    - geometric-mean / arithmetic-mean definition
+    - default power=2
+    - amin floor
+    - dimensionless flatness calculation
+
+    URLs:
+    https://librosa.org/doc/main/generated/librosa.feature.spectral_flatness.html
+    https://librosa.org/doc/0.11.0/_modules/librosa/feature/spectral.html
+
+
+S10. McFee, B. et al. librosa.pyin documentation.
+
+     Supports:
+     - probabilistic YIN F0 estimation
+     - generation of F0 candidates/probabilities
+     - Viterbi decoding
+     - F0 output in Hz
+     - voiced_flag
+     - voiced_probability
+
+     Also cites the primary pYIN paper:
+
+     Mauch, M. & Dixon, S. (2014).
+     pYIN: A Fundamental Frequency Estimator Using Probabilistic
+     Threshold Distributions.
+     IEEE International Conference on Acoustics, Speech and Signal
+     Processing (ICASSP).
+
+     URL:
+     https://librosa.org/doc/0.10.2/generated/librosa.pyin.html
+
+
+S11. McFee, B. et al. librosa.feature.melspectrogram documentation.
+
+     Supports:
+     - Mel filter-bank projection
+     - S**power formulation
+     - default power=2 for a power Mel spectrogram
+
+     URL:
+     https://librosa.org/doc/0.10.2/generated/librosa.feature.melspectrogram.html
+
+
+S12. McFee, B. et al. librosa.filters.mel documentation.
+
+     Supports:
+     - construction of the Mel filter bank
+     - default htk=False
+     - default Slaney normalization
+     - mapping from FFT bins to Mel bands
+
+     URL:
+     https://librosa.org/doc/0.10.2/generated/librosa.filters.mel.html
+
+
+S13. McFee, B. et al. librosa.core.convert / hz_to_mel source.
+
+     Supports:
+     - exact Slaney-style frequency-to-Mel implementation used when
+       htk=False
+     - linear part below 1000 Hz
+     - f_sp = 200/3
+     - min_log_hz = 1000
+     - min_log_mel = 15
+     - logstep = ln(6.4)/27
+     - logarithmic expression above 1000 Hz
+
+     URL:
+     https://librosa.org/doc/0.10.2/_modules/librosa/core/convert.html
+
+
+S14. McFee, B. et al. librosa.power_to_db documentation.
+
+     Supports:
+     - 10*log10 power conversion
+     - reference power
+     - default top_db=80
+
+     URL:
+     https://librosa.org/doc/0.10.2/generated/librosa.power_to_db.html
+
+
+S15. McFee, B. et al. librosa.feature.mfcc documentation and source.
+
+     Supports:
+     - MFCC computation from a log-power Mel spectrogram
+     - n_mfcc
+     - default DCT type II
+     - default orthonormal normalization
+
+     URL:
+     https://librosa.org/doc/0.10.2/generated/librosa.feature.mfcc.html
+
+
+S16. SciPy Developers. scipy.fft.dct documentation.
+
+     Supports:
+     - DCT-II mathematical definition
+     - orthonormal normalization
+     - normalization factors for the DCT-II basis
+
+     URL:
+     https://docs.scipy.org/doc/scipy/reference/generated/scipy.fft.dct.html
+
+
+S17. Scikit-learn Developers. RobustScaler documentation.
+
+     Supports:
+     - centering by feature median
+     - scaling by selected quantile range
+     - independent scaling of each feature
+     - configurable quantile_range
+
+     URL:
+     https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.RobustScaler.html
+
+
+S18. Scikit-learn Developers. Principal Component Analysis documentation.
+
+     Supports:
+     - PCA as projection onto orthogonal principal components
+     - ordering of components by explained variance
+     - lower-dimensional projection of multivariate data
+
+     URL:
+     https://scikit-learn.org/stable/modules/decomposition.html#pca
+
+
+S19. UMAP documentation. Parameters.
+
+     Supports:
+     - meaning of n_neighbors
+     - meaning of min_dist
+     - meaning of n_components
+     - choice of distance metric
+     - Euclidean metric availability
+     - interpretation of UMAP as a low-dimensional embedding
+
+     URL:
+     https://umap-learn.readthedocs.io/en/latest/parameters.html
+
+
+S20. McInnes, L., Healy, J. & Melville, J. (2018).
+
+     UMAP: Uniform Manifold Approximation and Projection for Dimension
+     Reduction.
+
+     arXiv:1802.03426
+
+     Supports:
+     - mathematical basis of UMAP
+     - neighborhood-graph construction
+     - manifold-based dimensionality reduction
+     - low-dimensional representation of high-dimensional data
+
+     URL:
+     https://arxiv.org/abs/1802.03426
+
+
+S21. Mauch, M. & Dixon, S. (2014).
+
+     pYIN: A Fundamental Frequency Estimator Using Probabilistic Threshold
+     Distributions.
+
+     Proceedings of the IEEE International Conference on Acoustics, Speech
+     and Signal Processing (ICASSP).
+
+     Supports:
+     - probabilistic extension of YIN
+     - probabilistic pitch candidates
+     - temporal decoding of F0 and voicing state
+
+
+S22. Davis, S. B. & Mermelstein, P. (1980).
+
+     Comparison of Parametric Representations for Monosyllabic Word
+     Recognition in Continuously Spoken Sentences.
+
+     IEEE Transactions on Acoustics, Speech, and Signal Processing,
+     28(4):357-366.
+
+     DOI:
+     10.1109/TASSP.1980.1163420
+
+     Relevance:
+     - classical reference for Mel/cepstral acoustic representations
+     - historical methodological background for MFCC-type features
+
+
+S23. Arese, L. (2026).
+
+     Shared acoustic manifolds for exploratory comparison of passerine
+     vocalizations.
+
+     EcoEvoRxiv.
+
+     DOI:
+     10.32942/X2W65N
+
+     Relevance:
+     - methodological inspiration for representing multiple vocalizations
+       in a shared low-dimensional acoustic space
+     - NOT the source of the exact 29-feature implementation, parameter
+       values, event detector, or trajectory-matching equations used here
+
+
+IMPLEMENTATION SOURCE
+=====================
+
+Tkachenko, V. (2026).
+
+    acoustic_trajectory_v1_3.py
+
+This is the direct source for the exact implementation-specific choices in
+this section, including:
+
+    n_fft = 8192
+    win_length = 8192
+    hop_length = 1536
+    Hann window
+    20-8000 Hz analysis band
+    29 selected feature dimensions
+    20 MFCC coefficients
+    64 Mel bands
+    spectral-entropy implementation
+    spectral-flux implementation
+    RMS reference choice
+    pYIN frequency constraints
+    RobustScaler quantile_range=(10,90)
+    clipping to [-8,+8]
+    PCA maximum of 10 components
+    UMAP 3-dimensional output
+    UMAP n_neighbors <= 25
+    UMAP min_dist = 0.05
+    Euclidean UMAP metric
+    UMAP random seed
+    maximum UMAP fit subsample
+    XYZ temporal smoothing
+    novelty calculation
+    event-boundary smoothing
+    minimum event separation
+    maximum event/node count
+
+These values are properties of the present pipeline and should not be
+attributed to librosa, scikit-learn, UMAP, Arese (2026), or any other external
+methodological source.

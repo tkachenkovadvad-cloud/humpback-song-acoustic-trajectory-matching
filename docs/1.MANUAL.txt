@@ -1,0 +1,335 @@
+ACOUSTIC TRAJECTORY MATCHING AND SONG-STRUCTURE RECONSTRUCTION
+
+PIPELINE OVERVIEW
+
+The pipeline consists of two general analytical stages and one optional,
+task-specific stage. First, short WAV signals are converted into acoustic
+trajectories in a shared feature space. Second, these trajectories are
+compared quantitatively to identify candidate matches for manual review.
+For the original humpback whale song analysis, manually validated recurrent
+units can additionally be passed to the optional Theme Graph Builder to
+examine repeated transitions and reconstruct candidate song themes.
+
+    WAV signals
+        -> shared acoustic trajectories
+        -> trajectory similarity matching
+        -> manual validation
+        -> [optional] transition graph / candidate-theme reconstruction
+
+1. INPUT DATA
+
+Start by dividing the original recording into individual acoustic units.
+Each unit should be exported as a separate WAV file. Keep a
+chronological table that links each unit to its position in the original
+recording.
+
+For later song-structure reconstruction, the current graph script
+expects these columns:
+
+    Selection
+    Begin Time (s)
+    End Time (s)
+    match
+
+The match column is filled after candidate matches have been reviewed.
+Units that are judged to belong to the same recurrent group receive the
+same group ID.
+
+Use unique, stable filenames so every result can be traced back to the
+original WAV.
+
+2. ACOUSTIC TRAJECTORY
+
+Script:
+
+    acoustic_trajectory_v1_3.py
+
+This is the first analytical stage.
+
+Give the script a set of short WAV signals that you want to compare. It
+extracts frame-level acoustic features and places all signals from that
+run in one shared low-dimensional acoustic space.
+
+Each signal becomes a time-ordered XYZ trajectory. The script also
+detects acoustic events and calculates event-centroid positions.
+
+Important:
+
+Signals that will be compared directly should be processed together in
+the same run. XYZ coordinates from separately fitted spaces should not
+be treated as one common coordinate system.
+
+Main outputs for each WAV:
+
+    <name>_frames_shared_space.csv
+    <name>_events_centroids_shared_space.csv
+    <name>_summary_shared_space.csv
+
+Main outputs for the full run:
+
+    all_signals_events_centroids_shared_space.csv
+    shared_acoustic_trajectories.html
+
+The HTML file is useful for visual inspection. The CSV files are the
+actual inputs for the matcher.
+
+3. TRAJECTORY SIMILARITY MATCHER
+
+Script:
+
+    trajectory_similarity_matcher_v0_6.py
+
+The matcher does not compare raw WAV files. It compares the shared-space
+CSV outputs from Stage 2.
+
+It compares every signal pair using several complementary measures,
+including:
+
+    shared-space trajectory distance
+    start-aligned trajectory shape
+    event-centroid acoustic content
+    multivariate DTW
+    discrete Frechet distance
+    Hausdorff distance
+    Procrustes disparity
+    curvature
+    direction changes and simple trajectory topology
+
+The matcher runs in two steps.
+
+Screening
+
+All possible pairs are compared quickly at lower resolution and ranked
+by combined distance.
+
+Output:
+
+    trajectory_similarity_screening_all_pairs.csv
+
+Full test
+
+The best screening candidates are tested at full resolution.
+
+For each tested pair, the observed ordered similarity is compared with a
+null distribution produced by disrupting the temporal order of one
+trajectory while preserving short local pieces.
+
+This asks a useful question:
+
+    Is the observed ordered trajectory similarity stronger than expected
+    after global temporal order is destroyed?
+
+The current matcher uses 499 permutations by default.
+
+Main output:
+
+    trajectory_similarity_matches.csv
+
+Resume output:
+
+    trajectory_similarity_matches_partial.csv
+
+The final table includes the similarity metrics, permutation p-value,
+effect size, and a decision:
+
+    strong_match_candidate
+    match_candidate
+    not_supported
+
+These labels are candidate classifications, not proof that two
+biological signals are identical. Candidate matches should still be
+reviewed.
+
+Optional diagnostic figures can show trajectory overlays, distance
+profiles, event-centroid clouds, null distributions, and a summary of
+the comparison.
+
+4. BATCH PROCESSING
+
+Script:
+
+    trajectory_similarity_batch.py
+
+The batch script is useful when many comparison groups have already been
+organized into numbered folders.
+
+Example:
+
+    trajectory_groups/
+        record_1/
+            1/
+            2/
+            3/
+        record_2/
+            1/
+            2/
+            3/
+
+Each numbered folder should already contain the Stage-2 trajectory
+outputs.
+
+The batch script applies the same v0.6 matcher logic across those
+folders and collects the results. It is not a second matching algorithm.
+
+Typical combined outputs are:
+
+    trajectory_similarity_matches_both_records.csv
+    trajectory_similarity_screening_both_records.csv
+    trajectory_similarity_batch_status_both_records.csv
+
+The first file contains the combined full-test results. The screening
+file contains the combined fast-screening results. The status file is
+only a record of processing progress.
+
+Batch processing is optional. For a single folder, the matcher can be
+run directly.
+
+5. MANUAL REVIEW
+
+The matcher is used to find and quantify candidate relationships.
+Candidate pairs are then inspected using the original audio and/or
+spectrograms.
+
+The review software is up to the user.
+
+For the humpback-song reconstruction task, confirmed recurrent units are
+assigned group IDs in the chronological table:
+
+    Selection    Begin Time (s)    End Time (s)    match
+
+The same value in match means that those units are treated as members of
+the same recurrent group.
+
+This reviewed table, not the automatic matcher decision alone, is used
+for the song-structure stage.
+
+6. OPTIONAL THEME GRAPH BUILDER
+
+Script:
+
+    theme_graph_builder_v2_0.py
+
+This stage is optional and was developed specifically for the humpback
+whale song reconstruction problem.
+
+It does not perform acoustic matching. It reads the chronological table
+with manually reviewed recurrent-group assignments and reconstructs how
+those groups occur through time.
+
+Matcher outputs can also be supplied to summarize acoustic similarity
+within groups, but they do not replace the reviewed chronological table.
+
+The graph builder:
+
+    creates one node for each recurrent group
+    creates directed edges for chronological transitions between groups
+    summarizes transition support
+    searches for repeated contiguous group sequences
+
+Version 2.0 counts independent, non-overlapping occurrences when
+evaluating repeated sequences. This prevents a long repeated run from
+producing inflated support simply because many sliding windows overlap.
+
+Main outputs:
+
+    selection_group_occurrences.csv
+    graph_nodes_matching_groups.csv
+    graph_edge_occurrences.csv
+    graph_edges_summary.csv
+    group_similarity_summary.csv
+    candidate_themes_maximal_nonoverlapping.csv
+    matching_group_transition_graph.graphml
+    matching_group_transition_graph.png
+
+The candidate-theme output is exploratory. It identifies repeated
+chronological patterns; it does not prove that a detected pattern is a
+canonical biological song theme.
+
+7. EXAMPLE PROJECT LAYOUT
+
+This is only an example. The parent-folder names are not required by the
+algorithms.
+
+    MY_PROJECT/
+    |
+    +-- original_recordings/
+    |   +-- record_1.wav
+    |   +-- record_2.wav
+    |
+    +-- selection_tables/
+    |   +-- record_1_selections.txt
+    |   +-- record_2_selections.txt
+    |
+    +-- units/
+    |   +-- record_1/
+    |   |   +-- R1.001.wav
+    |   |   +-- R1.002.wav
+    |   |   +-- ...
+    |   |
+    |   +-- record_2/
+    |       +-- R2.001.wav
+    |       +-- R2.002.wav
+    |       +-- ...
+    |
+    +-- trajectory_groups/
+    |   +-- record_1/
+    |   |   +-- 1/
+    |   |   +-- 2/
+    |   |   +-- ...
+    |   |
+    |   +-- record_2/
+    |       +-- 1/
+    |       +-- 2/
+    |       +-- ...
+    |
+    +-- matcher_combined/
+    |   +-- trajectory_similarity_matches_both_records.csv
+    |   +-- trajectory_similarity_screening_both_records.csv
+    |   +-- trajectory_similarity_batch_status_both_records.csv
+    |
+    +-- structure/
+        +-- record_1/
+        +-- record_2/
+
+8. IMPORTANT POINTS
+
+The trajectory script works on WAV signals.
+
+The matcher works on the trajectory CSVs, not directly on WAV audio.
+
+Signals intended for direct geometric comparison should be embedded
+together in the same shared-space run.
+
+The batch script uses the same matcher logic; it only automates many
+folders.
+
+Matcher decisions are candidate evidence and should be checked manually
+when biological identity matters.
+
+The Theme Graph Builder is not required for trajectory construction or
+signal matching. It is an optional downstream stage for the original
+song-structure problem.
+
+9. METHOD IN SHORT
+
+The pipeline separates the problem into three steps:
+
+    1. Representation
+       Convert each short acoustic signal into a time-ordered trajectory in a
+       shared acoustic feature space.
+
+    2. Matching
+       Compare trajectories and test whether their ordered similarity is
+       stronger than expected after temporal-order disruption.
+
+    3. Structure, optional
+       Use manually validated recurrent groups to examine repeated
+       chronological structure.
+
+The shared-acoustic-space idea was inspired by Lucio Arese, “Shared
+acoustic manifolds for exploratory comparison of passerine
+vocalizations.”
+
+This project extends that general idea with pairwise trajectory
+comparison, temporal-order permutation testing, manual validation, and
+an optional humpback-song structure reconstruction stage.

@@ -1,0 +1,526 @@
+SEQUENTIAL WORKFLOW FROM AUDIO TO ACOUSTIC TRAJECTORY
+======================================================
+
+This section describes the processing sequence implemented in
+acoustic_trajectory_v1_3.py. It is intended as a compact explanation of how
+the original waveform is converted into a shared three-dimensional acoustic
+trajectory and how acoustic-change nodes are detected.
+
+The complete process has two related branches:
+
+    1. construction of the shared XYZ acoustic trajectory;
+    2. detection of natural acoustic-change nodes within each signal.
+
+Both branches begin from the same 29-dimensional frame-level acoustic
+representation.
+
+
+1. OVERVIEW
+-----------
+
+The main trajectory pipeline is:
+
+    +-------------+
+    |  INPUT WAV  |
+    +-------------+
+           |
+           v
+    +-------------+
+    |    STFT     |
+    +-------------+
+           |
+           v
+    +--------------------------+
+    | 29 FEATURES PER FRAME    |
+    +--------------------------+
+           |
+           v
+    +--------------------------+
+    | SHARED ROBUST SCALING    |
+    | all WAVs pooled together |
+    +--------------------------+
+           |
+           v
+    +-------------+
+    |     PCA     |
+    | 29 -> <=10  |
+    +-------------+
+           |
+           v
+    +-----------------------+
+    | ROBUST SCALE PCA      |
+    +-----------------------+
+           |
+           v
+    +-------------+
+    |    UMAP     |
+    | <=10 -> 3   |
+    +-------------+
+           |
+           v
+    +-------------+
+    |   X, Y, Z   |
+    +-------------+
+           |
+           v
+    +-----------------------+
+    | TEMPORAL SMOOTHING    |
+    +-----------------------+
+           |
+           v
+    +-----------------------+
+    | ACOUSTIC TRAJECTORY   |
+    +-----------------------+
+
+
+2. STEP 1 - FRAME THE AUDIO
+---------------------------
+
+Each WAV is converted from a waveform into a sequence of short overlapping
+time-frequency frames using the Short-Time Fourier Transform (STFT).
+
+Current parameters are:
+
+    FFT length       = 8192 samples
+    window length    = 8192 samples
+    hop length       = 1536 samples
+    window           = Hann
+    analysis band    = 20-8000 Hz
+
+At a sampling rate of 192 kHz, the hop corresponds to:
+
+    1536 / 192000 = 0.008 s = 8 ms
+
+Thus, the acoustic state of the signal is evaluated approximately every
+8 ms.
+
+
+3. STEP 2 - DESCRIBE EACH FRAME WITH 29 FEATURES
+------------------------------------------------
+
+For every frame, the pipeline constructs one vector:
+
+    F(t) in R^29
+
+containing:
+
+     1  RMS_dB
+     2  spectral centroid
+     3  spectral bandwidth
+     4  85% spectral rolloff
+     5  spectral flatness
+     6  spectral entropy
+     7  spectral flux
+     8  pitch / F0
+     9  voiced probability
+    10-29  MFCC_01 ... MFCC_20
+
+These features represent complementary properties of the frame:
+
+    amplitude             -> RMS_dB
+
+    spectral position     -> centroid
+    spectral spread       -> bandwidth
+    upper spectral extent -> rolloff
+
+    spectral organization -> flatness + entropy
+
+    temporal change       -> spectral flux
+
+    periodicity           -> pitch + voiced probability
+
+    spectral-envelope
+    shape                 -> 20 MFCCs
+
+The result for one WAV is therefore not one feature vector, but a time-ordered
+matrix:
+
+                   29 FEATURES
+              <------------------>
+
+    frame 1   [ . . . . . . . . ]
+    frame 2   [ . . . . . . . . ]
+    frame 3   [ . . . . . . . . ]
+       .               .
+       .               .
+    frame T   [ . . . . . . . . ]
+
+                 |
+                 v
+
+              X_WAV
+           shape = T x 29
+
+
+4. STEP 3 - POOL THE SIGNALS INTO ONE SHARED SPACE
+--------------------------------------------------
+
+If several WAVs are being compared, their feature matrices are stacked:
+
+    WAV 1 : T1 x 29
+    WAV 2 : T2 x 29
+    WAV 3 : T3 x 29
+             .
+             .
+             .
+
+              |
+              v
+
+    +----------------------+
+    | ALL FRAMES x 29      |
+    | FROM ALL INPUT WAVs  |
+    +----------------------+
+
+This step is fundamental.
+
+The signals are not independently converted into unrelated XYZ spaces.
+Instead, one common transformation is learned from the pooled acoustic data.
+
+Consequently, the resulting trajectories occupy the same fitted coordinate
+system and can be compared geometrically.
+
+
+5. STEP 4 - NORMALIZE THE 29 FEATURES
+-------------------------------------
+
+The 29 features have different units and numerical ranges. For example,
+frequency variables are measured in Hz, voiced probability is approximately
+0-1, RMS is expressed in relative dB, and MFCCs have their own numerical
+scale.
+
+The pooled feature matrix is therefore transformed with:
+
+    RobustScaler(quantile_range=(10,90))
+
+For each feature separately:
+
+                       value - median
+    scaled value = -------------------------
+                         Q90 - Q10
+
+The result is then clipped to:
+
+    -8 <= scaled value <= +8
+
+This prevents the geometry from being dominated simply by units or by a small
+number of extreme frames.
+
+The important point is:
+
+    BEFORE SCALING
+
+        2000 Hz and 0.5 probability
+        have completely different numerical scales.
+
+    AFTER SCALING
+
+        every feature is represented relative to
+        its own distribution in the pooled dataset.
+
+
+6. STEP 5 - COMPRESS 29 FEATURES WITH PCA
+-----------------------------------------
+
+The scaled 29-dimensional representation is reduced with Principal Component
+Analysis:
+
+    29 acoustic dimensions
+              |
+              v
+        +-----------+
+        |    PCA    |
+        +-----------+
+              |
+              v
+       <=10 dimensions
+
+PCA combines correlated input variables into a smaller set of orthogonal
+components.
+
+This means that the pipeline does NOT assign one original acoustic variable
+to one final coordinate.
+
+Instead:
+
+    centroid -----\
+    bandwidth -----\
+    pitch ----------\
+    entropy ---------> PCA components
+    MFCCs -----------/
+    RMS ------------/
+    etc. -----------/
+
+All 29 features can therefore contribute to the reduced representation.
+
+The PCA coordinates are then robust-scaled again and clipped to [-8,+8].
+
+This second scaling prevents the first PCA components from dominating the
+next distance-based stage simply because they have greater variance.
+
+
+7. STEP 6 - PROJECT THE PCA REPRESENTATION INTO XYZ
+---------------------------------------------------
+
+The scaled PCA representation is passed to UMAP:
+
+    <=10 PCA dimensions
+             |
+             v
+       +-----------+
+       |   UMAP    |
+       +-----------+
+             |
+             v
+        3 dimensions
+             |
+             v
+         X   Y   Z
+
+Current main parameters are:
+
+    n_components = 3
+    n_neighbors  <= 25
+    min_dist     = 0.05
+    metric       = Euclidean
+
+Each original audio frame now has one three-dimensional position:
+
+    frame t -> [X(t), Y(t), Z(t)]
+
+X, Y and Z are dimensionless embedding coordinates.
+
+They must NOT be interpreted individually as:
+
+    X = pitch
+    Y = frequency
+    Z = amplitude
+
+The acoustic information has already been combined by PCA and UMAP.
+
+Instead, the XYZ position represents the multivariate acoustic state of the
+frame in the shared space.
+
+
+8. STEP 7 - CONNECT THE FRAMES THROUGH TIME
+-------------------------------------------
+
+The XYZ points retain their original chronological order:
+
+    t1       t2       t3       t4               tN
+
+     o ------ o ------ o ------ o ---- ... ----- o
+     |        |        |        |                 |
+    XYZ1     XYZ2     XYZ3     XYZ4              XYZN
+
+This ordered path is the acoustic trajectory.
+
+In mathematical form:
+
+    trajectory =
+        {
+            [X(1), Y(1), Z(1)],
+            [X(2), Y(2), Z(2)],
+            ...
+            [X(T), Y(T), Z(T)]
+        }
+
+The XYZ coordinates are lightly smoothed through time after projection to
+reduce small frame-to-frame jitter.
+
+Therefore, the final trajectory represents:
+
+    WHERE the acoustic state is located
+                 +
+    HOW that state changes through time
+
+
+9. PARALLEL BRANCH - DETECT NATURAL ACOUSTIC NODES
+---------------------------------------------------
+
+Node detection starts from the SAME 29 features, but it serves a different
+purpose and therefore uses a separate normalization.
+
+The trajectory branch asks:
+
+    "Where do frames from all signals lie in a common acoustic space?"
+
+The node branch asks:
+
+    "Where does THIS signal change substantially relative to itself?"
+
+
+The node pipeline is:
+
+    +-----------------------+
+    | ONE WAV: T x 29       |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | WITHIN-WAV            |
+    | ROBUST SCALING        |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | DIFFERENCE BETWEEN    |
+    | ADJACENT FRAMES       |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | EUCLIDEAN DISTANCE    |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | NOVELTY CURVE         |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | SMOOTH + FIND PEAKS   |
+    +-----------------------+
+               |
+               v
+    +-----------------------+
+    | ACOUSTIC NODES        |
+    +-----------------------+
+
+
+For one WAV, the 29 features are robust-scaled independently.
+
+The change between adjacent frames is then:
+
+    novelty(t) =
+        sqrt(
+            SUM_(j=1)^29
+            [Z_j(t) - Z_j(t-1)]^2
+        )
+
+Thus, novelty measures the total multivariate acoustic change from one frame
+to the next.
+
+A peak can therefore result from a change in pitch, spectral envelope,
+amplitude, spectral distribution, or several properties simultaneously.
+
+The novelty curve is smoothed over approximately 80 ms, and candidate peaks
+are constrained by a minimum separation of approximately 120 ms.
+
+The current implementation retains a maximum of 40 nodes.
+
+The resulting nodes are therefore acoustic-change points rather than arbitrary
+equal-duration divisions of the signal.
+
+
+10. THE TWO BRANCHES REJOIN
+---------------------------
+
+The important distinction is:
+
+                    SAME 29 FEATURES
+                          |
+             +------------+------------+
+             |                         |
+             v                         v
+      SHARED NORMALIZATION      WITHIN-WAV NORMALIZATION
+      across all WAVs           separately for each WAV
+             |                         |
+             v                         v
+         PCA -> UMAP              novelty curve
+             |                         |
+             v                         v
+           XYZ                    event nodes
+             |                         |
+             +------------+------------+
+                          |
+                          v
+                TRAJECTORY + EVENTS
+
+
+The shared branch determines the geometry in which signals can be compared.
+
+The within-WAV branch determines where meaningful acoustic changes occur
+along each individual signal.
+
+These operations should not be confused: the node detector does not define
+the XYZ coordinate system, and the shared UMAP projection does not determine
+the node boundaries.
+
+
+11. COMPLETE PIPELINE IN ONE DIAGRAM
+------------------------------------
+
+    AUDIO
+      |
+      v
+    STFT
+      |
+      v
+    29 FEATURES / FRAME
+      |
+      +-----------------------------+
+      |                             |
+      | SHARED TRAJECTORY           | EVENT DETECTION
+      |                             |
+      v                             v
+    pool all WAVs                one WAV
+      |                             |
+      v                             v
+    RobustScaler                RobustScaler
+      |                             |
+      v                             v
+    PCA <=10                   frame differences
+      |                             |
+      v                             v
+    RobustScaler                Euclidean norm
+      |                             |
+      v                             v
+    UMAP -> XYZ                novelty curve
+      |                             |
+      v                             v
+    XYZ smoothing              smooth + peaks
+      |                             |
+      v                             v
+    TRAJECTORY                    NODES
+      |                             |
+      +-------------+---------------+
+                    |
+                    v
+          TRAJECTORY WITH
+          ACOUSTIC EVENTS
+
+
+12. CORE PRINCIPLE
+------------------
+
+The pipeline does not compare vocalizations using one acoustic measurement.
+
+Instead, every short frame is first represented by 29 complementary acoustic
+dimensions. These dimensions are placed onto comparable scales, compressed,
+and projected into one shared three-dimensional acoustic space.
+
+The chronological movement of a signal through that space forms its acoustic
+trajectory.
+
+Separately, changes across the same 29-dimensional representation are used to
+identify natural within-signal acoustic events.
+
+In short:
+
+    29 acoustic features
+            +
+    common coordinate system
+            +
+    temporal order
+            =
+    acoustic trajectory
+
+while:
+
+    29 acoustic features
+            +
+    within-signal change
+            =
+    acoustic nodes
