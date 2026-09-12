@@ -5,6 +5,13 @@ task. The original goal was to compare a large number of short vocal
 units, identify supported candidate matches, and use manually validated
 recurrent units to explore possible song-theme reconstruction.
 
+## Acoustic trajectory visualization
+
+![Shared acoustic trajectory playback](assets/shared_acoustic_trajectory_demo.gif)
+
+Example playback of an acoustic signal represented as a time-dependent
+trajectory in the shared multivariate acoustic space.
+
 A central principle of the pipeline is machine-based matching followed
 by human validation. Rather than asking multiple independent observers
 to visually or aurally classify the same units and then reconcile their
