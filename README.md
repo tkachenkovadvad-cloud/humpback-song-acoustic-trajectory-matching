@@ -5,8 +5,6 @@ task. The original goal was to compare a large number of short vocal
 units, identify supported candidate matches, and use manually validated
 recurrent units to explore possible song-theme reconstruction.
 
-## Acoustic trajectory visualization
-
 ![Shared acoustic trajectory playback](assets/shared_acoustic_trajectory_demo.gif)
 
 Example playback of an acoustic signal represented as a time-dependent
